@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ..plot_helpers import show_or_save_fig, show_or_save_plot
 from .compare import Compare
 
 
@@ -90,11 +91,9 @@ class CompareFlights(Compare):
         -------
         None
         """
+        show_or_save_fig(fig, filename)
         if filename:
-            fig.savefig(filename)
             print("Plot saved to file: " + filename)
-        else:
-            plt.show()
         return None
 
     def __process_legend(self, legend, fig):
@@ -1208,9 +1207,11 @@ class CompareFlights(Compare):
             Tuple with the size of the figure. The default is (7,7).
         legend : boolean, optional
             Whether legend will or will not be plotted. Default is True
-        filename : string, optional
-            If a filename is passed, the figure will be saved in the current
-            directory. The default is None.
+        filename : str | None, optional
+            The path the plot should be saved to. By default None, in which case
+            the plot will be shown instead of saved. Supported file endings are:
+            eps, jpg, jpeg, pdf, pgf, png, ps, raw, rgba, svg, svgz, tif, tiff
+            and webp (these are the formats supported by matplotlib).
 
         Returns
         -------
@@ -1276,10 +1277,7 @@ class CompareFlights(Compare):
         fig1.tight_layout()
 
         # Save figure
-        if filename:
-            plt.savefig(filename)
-        else:
-            plt.show()
+        show_or_save_plot(filename)
 
         return None
 
@@ -1294,8 +1292,11 @@ class CompareFlights(Compare):
             must be in the form (width, height).
         legend : boolean, optional
             Whether legend will or will not be included. Default is True
-        savefig : string, optional
-            If a string is passed, the figure will be saved in the path passed.
+        filename : str | None, optional
+            The path the plot should be saved to. By default None, in which case
+            the plot will be shown instead of saved. Supported file endings are:
+            eps, jpg, jpeg, pdf, pgf, png, ps, raw, rgba, svg, svgz, tif, tiff
+            and webp (these are the formats supported by matplotlib).
 
         Returns
         -------
@@ -1474,6 +1475,11 @@ class CompareFlights(Compare):
             .svg, .pgf, .eps
         figsize : tuple, optional
             Tuple with the size of the figure. The default is (7, 7).
+        filename : str | None, optional
+            The path the plot should be saved to. By default None, in which case
+            the plot will be shown instead of saved. Supported file endings are:
+            eps, jpg, jpeg, pdf, pgf, png, ps, raw, rgba, svg, svgz, tif, tiff
+            and webp (these are the formats supported by matplotlib).
 
         Returns
         -------
@@ -1517,10 +1523,7 @@ class CompareFlights(Compare):
         fig.tight_layout()
 
         # Save figure
-        if filename:
-            plt.savefig(filename)
-        else:
-            plt.show()
+        show_or_save_plot(filename)
 
         return None
 
