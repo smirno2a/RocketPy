@@ -39,7 +39,7 @@ class _EnvironmentPrints:
         print("\nGravity Details\n")
         print(f"Acceleration of gravity at surface level: {surface_gravity:9.4f} m/s²")
         print(
-            f"Acceleration of gravity at {max_expected_height/1000:7.3f} "
+            f"Acceleration of gravity at {max_expected_height / 1000:7.3f} "
             f"km (ASL): {ceiling_gravity:.4f} m/s²\n"
         )
 
@@ -76,15 +76,16 @@ class _EnvironmentPrints:
             print(f"Launch Site Latitude: {self.environment.latitude:.5f}°")
             print(f"Launch Site Longitude: {self.environment.longitude:.5f}°")
         print(f"Reference Datum: {self.environment.datum}")
-        print(
-            f"Launch Site UTM coordinates: {self.environment.initial_east:.2f} "
-            f"{self.environment.initial_ew}    {self.environment.initial_north:.2f} "
-            f"{self.environment.initial_hemisphere}"
-        )
-        print(
-            f"Launch Site UTM zone: {self.environment.initial_utm_zone}"
-            f"{self.environment.initial_utm_letter}"
-        )
+        if self.environment.initial_east:
+            print(
+                f"Launch Site UTM coordinates: {self.environment.initial_east:.2f} "
+                f"{self.environment.initial_ew}    {self.environment.initial_north:.2f} "
+                f"{self.environment.initial_hemisphere}"
+            )
+            print(
+                f"Launch Site UTM zone: {self.environment.initial_utm_zone}"
+                f"{self.environment.initial_utm_letter}"
+            )
         print(f"Launch Site Surface Elevation: {self.environment.elevation:.1f} m\n")
 
     def atmospheric_model_details(self):

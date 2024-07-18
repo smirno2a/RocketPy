@@ -838,6 +838,7 @@ class Flight:  # pylint: disable=too-many-public-methods
                         phase.solver.status = "finished"
 
                     # Check for apogee event
+                    # TODO: negative vz doesn't really mean apogee. Improve this.
                     if len(self.apogee_state) == 1 and self.y_sol[5] < 0:
                         # Assume linear vz(t) to detect when vz = 0
                         t0, vz0 = self.solution[-2][0], self.solution[-2][6]
@@ -863,6 +864,10 @@ class Flight:  # pylint: disable=too-many-public-methods
                             phase.time_nodes.flush_after(node_index)
                             phase.time_nodes.add_node(self.t, [], [])
                             phase.solver.status = "finished"
+                        elif len(self.solution) > 2:
+                            # adding the apogee state to solution increases accuracy
+                            # we can only do this if the apogee is not the first state
+                            self.solution.insert(-1, [t_root, *self.apogee_state])
                     # Check for impact event
                     if self.y_sol[2] < self.env.elevation:
                         # Check exactly when it happened using root finding
@@ -1440,8 +1445,8 @@ class Flight:  # pylint: disable=too-many-public-methods
             comp_cp = (
                 position - self.rocket.center_of_dry_mass_position
             ) * self.rocket._csys - aero_surface.cpz
-            surface_radius = aero_surface.rocket_radius
-            reference_area = np.pi * surface_radius**2
+            reference_area = aero_surface.reference_area
+            reference_length = aero_surface.reference_length
             # Component absolute velocity in body frame
             comp_vx_b = vx_b + comp_cp * omega2
             comp_vy_b = vy_b - comp_cp * omega1
@@ -1491,15 +1496,14 @@ class Flight:  # pylint: disable=too-many-public-methods
                 M3_forcing = (
                     (1 / 2 * rho * free_stream_speed**2)
                     * reference_area
-                    * 2
-                    * surface_radius
+                    * reference_length
                     * clf_delta.get_value_opt(free_stream_mach)
                     * cant_angle_rad
                 )
                 M3_damping = (
                     (1 / 2 * rho * free_stream_speed)
                     * reference_area
-                    * (2 * surface_radius) ** 2
+                    * (reference_length) ** 2
                     * cld_omega.get_value_opt(free_stream_mach)
                     * omega3
                     / 2
@@ -1670,13 +1674,13 @@ class Flight:  # pylint: disable=too-many-public-methods
         ## Nozzle gyration tensor
         S_nozzle = self.rocket.nozzle_gyration_tensor
         ## Inertia tensor
-        I = self.rocket.get_inertia_tensor_at_time(t)
+        inertia_tensor = self.rocket.get_inertia_tensor_at_time(t)
         ## Inertia tensor time derivative in the body frame
         I_dot = self.rocket.get_inertia_tensor_derivative_at_time(t)
 
         # Calculate the Inertia tensor relative to CM
         H = (r_CM.cross_matrix @ -r_CM.cross_matrix) * total_mass
-        I_CM = I - H
+        I_CM = inertia_tensor - H
 
         # Prepare transformation matrices
         K = Matrix.transformation(e)
@@ -1723,8 +1727,8 @@ class Flight:  # pylint: disable=too-many-public-methods
                 position - self.rocket.center_of_dry_mass_position
             ) * self.rocket._csys - aero_surface.cpz
             comp_cp = Vector([0, 0, comp_cpz])
-            surface_radius = aero_surface.rocket_radius
-            reference_area = np.pi * surface_radius**2
+            reference_area = aero_surface.reference_area
+            reference_length = aero_surface.reference_length
             # Component absolute velocity in body frame
             comp_vb = velocity_in_body_frame + (w ^ comp_cp)
             # Wind velocity at component altitude
@@ -1768,15 +1772,14 @@ class Flight:  # pylint: disable=too-many-public-methods
                 M3_forcing = (
                     (1 / 2 * rho * comp_stream_speed**2)
                     * reference_area
-                    * 2
-                    * surface_radius
+                    * reference_length
                     * clf_delta.get_value_opt(comp_stream_mach)
                     * cant_angle_rad
                 )
                 M3_damping = (
                     (1 / 2 * rho * comp_stream_speed)
                     * reference_area
-                    * (2 * surface_radius) ** 2
+                    * (reference_length) ** 2
                     * cld_omega.get_value_opt(comp_stream_mach)
                     * omega3
                     / 2
@@ -1820,7 +1823,7 @@ class Flight:  # pylint: disable=too-many-public-methods
         )
 
         T21 = (
-            ((I @ w) ^ w)
+            ((inertia_tensor @ w) ^ w)
             + T05 @ w
             - (weight_in_body_frame ^ r_CM)
             + Vector([M1, M2, M3])

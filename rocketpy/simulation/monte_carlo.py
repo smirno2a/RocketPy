@@ -2,14 +2,14 @@
 Monte Carlo Simulation Module for RocketPy
 
 This module defines the `MonteCarlo` class, which is used to perform Monte Carlo
-simulations of rocket flights. The Monte Carlo simulation is a powerful tool for 
-understanding the variability and uncertainty in the performance of rocket flights 
+simulations of rocket flights. The Monte Carlo simulation is a powerful tool for
+understanding the variability and uncertainty in the performance of rocket flights
 by running multiple simulations with varied input parameters.
 
 Notes
 -----
-This module is still under active development, and some features or attributes may 
-change in future versions. Users are encouraged to check for updates and read the 
+This module is still under active development, and some features or attributes may
+change in future versions. Users are encouraged to check for updates and read the
 latest documentation.
 """
 
@@ -397,10 +397,10 @@ class MonteCarlo:
                 "lateral_surface_wind",
             }
         )
-        # NOTE: exportables needs to be updated with Flight numerical properties
-        #       example: You added the property 'inclination' to Flight, so you may
-        #       need to add it to exportables as well. But don't add other types.
-        exportables = set(
+        # NOTE: this list needs to be updated with Flight numerical properties
+        #       example: You added the property 'inclination' to Flight.
+        #       But don't add other types.
+        can_be_exported = set(
             {
                 "inclination",
                 "heading",
@@ -456,7 +456,7 @@ class MonteCarlo:
                     raise TypeError("Variables in export_list must be strings.")
 
                 # Checks if attribute is not valid
-                if attr not in exportables:
+                if attr not in can_be_exported:
                     raise ValueError(
                         f"Attribute '{attr}' can not be exported. Check export_list."
                     )
