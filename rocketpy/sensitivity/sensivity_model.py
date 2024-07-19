@@ -259,7 +259,7 @@ class SensitivityModel:
             self.n_parameters, self.number_of_samples
         ).T
         X = parameters_matrix - offset_matrix
-
+        X = sm.add_constant(X)
         # When target data is a 1d-array, transform to 2d-array
         if target_data.ndim == 1:
             target_data = target_data.reshape(self.number_of_samples, 1)
@@ -273,9 +273,9 @@ class SensitivityModel:
             self.target_variables_info[target_variable]["model"] = fitted_model
 
             # Compute sensitivity
-            beta = fitted_model.params
-            sd_eps = fitted_model.scale
-            var_Y = sd_eps**2
+            beta = fitted_model.params[1:]  # skipping the intercept
+            var_eps = fitted_model.scale
+            var_Y = var_eps
             for k, parameter in enumerate(self.parameters_names):
                 sensitivity = np.power(beta[k], 2) * np.power(parameters_sd[k], 2)
                 self.target_variables_info[target_variable]["sensitivity"][
@@ -290,7 +290,7 @@ class SensitivityModel:
                 self.target_variables_info[target_variable]["sensitivity"][
                     parameter
                 ] /= var_Y
-            self.target_variables_info[target_variable]["LAE"] = sd_eps**2
+            self.target_variables_info[target_variable]["LAE"] = var_eps
             self.target_variables_info[target_variable]["LAE"] /= var_Y
 
         self._fitted = True
@@ -456,13 +456,12 @@ class SensitivityModel:
                 self.target_variables_info[target_variable]["nominal_value"], digits
             )
             norm_quantile = norm.ppf((1 + alpha) / 2)
-            if self._estimate_target_nominal:
+            if self._nominal_target_passed:
                 table.add_row([f"Nominal value: {nominal_value}"])
             else:
                 table.add_row([f"Estimated value: {nominal_value}"])
             target_sd = self.target_variables_info[target_variable]["sd"]
-            total_variance = np.power(target_sd, 2)
-            table.add_row([f"Variance: {round(total_variance, digits)}"])
+            table.add_row([f"Std: {round(target_sd, digits)}"])
             ci_lower = round(nominal_value - norm_quantile * target_sd, digits)
             ci_upper = round(nominal_value + norm_quantile * target_sd, digits)
             table.add_row(
