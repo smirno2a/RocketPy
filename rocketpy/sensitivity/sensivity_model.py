@@ -401,7 +401,7 @@ class SensitivityModel:
             nominal_sd_text = "Estimated sd"
         for target_variable in self.target_variables_names:
             model = self.target_variables_info[target_variable]["model"]
-            coef = model.params
+            coef = model.params[1:]  # skipping intercept
             pvalues = model.pvalues
 
             sensitivity_table = pt.PrettyTable()
