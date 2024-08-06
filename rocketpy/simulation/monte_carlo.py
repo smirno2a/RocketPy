@@ -14,12 +14,17 @@ latest documentation.
 """
 
 import json
+import os
+import queue
 import warnings
-from time import process_time, time
+from copy import deepcopy
+from pathlib import Path
+from time import time
 
 import numpy as np
 import simplekml
 
+from rocketpy import Function
 from rocketpy._encoders import RocketPyEncoder
 from rocketpy.plots.monte_carlo_plots import _MonteCarloPlots
 from rocketpy.prints.monte_carlo_prints import _MonteCarloPrints
@@ -27,6 +32,7 @@ from rocketpy.simulation.flight import Flight
 from rocketpy.tools import (
     generate_monte_carlo_ellipses,
     generate_monte_carlo_ellipses_coordinates,
+    import_optional_dependency,
 )
 
 # TODO: Create evolution plots to analyze convergence
@@ -79,8 +85,17 @@ class MonteCarlo:
         spent waiting for I/O operations or other processes to complete.
     """
 
+    _last_print_len = 0  # used to print on the same line
+
     def __init__(
-        self, filename, environment, rocket, flight, export_list=None
+        self,
+        filename,
+        environment,
+        rocket,
+        flight,
+        export_list=None,
+        batch_path=None,
+        export_sample_time=0.1,
     ):  # pylint: disable=too-many-statements
         """
         Initialize a MonteCarlo object.
@@ -104,6 +119,13 @@ class MonteCarlo:
             `out_of_rail_stability_margin`, `out_of_rail_time`,
             `out_of_rail_velocity`, `max_mach_number`, `frontal_surface_wind`,
             `lateral_surface_wind`. Default is None.
+        batch_path : str, optional
+            Path to the batch folder to be used in the simulation. Export file
+            will be saved in this folder. Default is None.
+        export_sample_time : float, optional
+            Sample time to downsample the arrays in seconds. Used to automatically
+            discretize inputs that contain callable ``rocketpy.Function`` objects.
+            Default is 0.1.
 
         Returns
         -------
@@ -128,29 +150,40 @@ class MonteCarlo:
         self.processed_results = {}
         self.prints = _MonteCarloPrints(self)
         self.plots = _MonteCarloPlots(self)
-        self._inputs_dict = {}
-        self._last_print_len = 0  # used to print on the same line
+        self.export_sample_time = export_sample_time
+
+        if batch_path is None:
+            self.batch_path = Path.cwd()
+        else:
+            self.batch_path = Path(batch_path)
+
+        if not os.path.exists(self.batch_path):
+            os.makedirs(self.batch_path)
 
         self.export_list = self.__check_export_list(export_list)
 
         try:
             self.import_inputs()
         except FileNotFoundError:
-            self._input_file = f"{filename}.inputs.txt"
+            self._input_file = self.batch_path / f"{filename}.inputs.txt"
 
         try:
             self.import_outputs()
         except FileNotFoundError:
-            self._output_file = f"{filename}.outputs.txt"
+            self._output_file = self.batch_path / f"{filename}.outputs.txt"
 
         try:
             self.import_errors()
         except FileNotFoundError:
-            self._error_file = f"{filename}.errors.txt"
+            self._error_file = self.batch_path / f"{filename}.errors.txt"
 
     # pylint: disable=consider-using-with
     def simulate(
-        self, number_of_simulations, append=False
+        self,
+        number_of_simulations,
+        append=False,
+        parallel=False,
+        n_workers=None,
     ):  # pylint: disable=too-many-statements
         """
         Runs the Monte Carlo simulation and saves all data.
@@ -162,6 +195,12 @@ class MonteCarlo:
         append : bool, optional
             If True, the results will be appended to the existing files. If
             False, the files will be overwritten. Default is False.
+        parallel : bool, optional
+            If True, the simulations will be run in parallel. Default is False.
+        n_workers : int, optional
+            Number of workers to be used if ``parallel=True``. If None, the
+            number of workers will be equal to the number of CPUs available.
+            Default is None.
 
         Returns
         -------
@@ -181,186 +220,406 @@ class MonteCarlo:
         overwritten. Make sure to save the files with the results before
         running the simulation again with `append=False`.
         """
-        # Create data files for inputs, outputs and error logging
-        open_mode = "a" if append else "w"
-        input_file = open(self._input_file, open_mode, encoding="utf-8")
-        output_file = open(self._output_file, open_mode, encoding="utf-8")
-        error_file = open(self._error_file, open_mode, encoding="utf-8")
-
-        # initialize counters
         self.number_of_simulations = number_of_simulations
-        self.__iteration_count = self.num_of_loaded_sims if append else 0
-        self.__start_time = time()
-        self.__start_cpu_time = process_time()
+        self._initial_sim_idx = self.num_of_loaded_sims if append else 0
 
         # Begin display
-        print("Starting Monte Carlo analysis", end="\r")
+        MonteCarlo._reprint("Starting Monte Carlo analysis")
 
-        try:
-            while self.__iteration_count < self.number_of_simulations:
-                self.__run_single_simulation(input_file, output_file)
-        except KeyboardInterrupt:
-            print("Keyboard Interrupt, files saved.")
-            error_file.write(json.dumps(self._inputs_dict, cls=RocketPyEncoder) + "\n")
-            self.__close_files(input_file, output_file, error_file)
-        except Exception as error:
-            print(f"Error on iteration {self.__iteration_count}: {error}")
-            error_file.write(json.dumps(self._inputs_dict, cls=RocketPyEncoder) + "\n")
-            self.__close_files(input_file, output_file, error_file)
-            raise error
-        finally:
-            self.total_cpu_time = process_time() - self.__start_cpu_time
-            self.total_wall_time = time() - self.__start_time
+        # Setup files
+        self.__setup_files(append)
 
-        self.__terminate_simulation(input_file, output_file, error_file)
+        # Run simulations
+        if parallel:
+            self.__run_in_parallel(n_workers)
+        else:
+            self.__run_in_serial()
 
-    # Auxiliary methods
+        self.__terminate_simulation()
 
-    def __run_single_simulation(self, input_file, output_file):
+    def __setup_files(self, append):
         """
-        Runs a single simulation and saves the inputs and outputs to the
-        respective files.
+        Sets up the files for the simulation, creating then if necessary.
 
         Parameters
         ----------
-        input_file : str
-            The file object to write the inputs.
-        output_file : str
-            The file object to write the outputs.
+        append : bool
+            If ``True``, the results will be appended to the existing files. If
+            ``False``, the files will be overwritten.
 
         Returns
         -------
         None
         """
-        self.__iteration_count += 1
+        # Create data files for inputs, outputs and error logging
+        open_mode = "r+" if append else "w+"
 
+        try:
+            with open(self._input_file, open_mode, encoding="utf-8") as input_file:
+                idx_i = len(input_file.readlines())
+            with open(self._output_file, open_mode, encoding="utf-8") as output_file:
+                idx_o = len(output_file.readlines())
+            open(self._error_file, open_mode, encoding="utf-8").close()
+
+            if idx_i != idx_o and not append:
+                raise ValueError(
+                    "Input and output files are not synchronized. Append mode is not available."
+                )
+
+        except OSError as error:
+            raise OSError(f"Error creating files: {error}") from error
+
+    def __run_in_serial(self):
+        """
+        Runs the monte carlo simulation in serial mode.
+
+        Parameters
+        ----------
+        start_index : int
+            The index of the first simulation to be run.
+
+        Returns
+        -------
+        None
+        """
+        sim_monitor = _SimMonitor(
+            initial_count=self._initial_sim_idx,
+            n_simulations=self.number_of_simulations,
+            start_time=time(),
+        )
+        try:
+            while sim_monitor.keep_simulating():
+                sim_monitor.increment()
+
+                inputs_dict, outputs_dict = MonteCarlo.__run_single_simulation(
+                    sim_monitor.count,
+                    self.environment,
+                    self.rocket,
+                    self.flight,
+                    self.export_list,
+                    self.export_sample_time,
+                )
+
+                MonteCarlo.__export_flight_data(
+                    inputs_dict,
+                    outputs_dict,
+                    self._input_file,
+                    self._output_file,
+                )
+
+                sim_monitor.print_update_status(sim_monitor.count)
+
+            sim_monitor.print_final_status()
+
+        except KeyboardInterrupt:
+            MonteCarlo._reprint("Keyboard Interrupt, files saved.")
+            with open(self._error_file, "a", encoding="utf-8") as file:
+                file.write(json.dumps(inputs_dict, cls=RocketPyEncoder) + "\n")
+
+        except Exception as error:
+            MonteCarlo._reprint(
+                f"Error on iteration {self.__sim_monitor.count}: {error}"
+            )
+            with open(self._error_file, "a", encoding="utf-8") as file:
+                file.write(json.dumps(inputs_dict, cls=RocketPyEncoder) + "\n")
+            raise error
+
+    def __run_in_parallel(self, n_workers=None):
+        """
+        Runs the monte carlo simulation in parallel.
+
+        Parameters
+        ----------
+        n_workers: int, optional
+            Number of workers to be used. If None, the number of workers
+            will be equal to the number of CPUs available. Default is None.
+
+        Returns
+        -------
+        None
+        """
+        if n_workers is None or n_workers > os.cpu_count():
+            n_workers = os.cpu_count()
+
+        if n_workers < 3:
+            raise ValueError("Number of workers must be at least 3 for parallel mode.")
+
+        multiprocess, managers = import_multiprocess()
+
+        with create_multiprocess_manager(multiprocess, managers) as manager:
+            export_queue = manager.Queue()
+            mutex = manager.Lock()
+            consumer_stop_event = manager.Event()
+
+            sim_monitor = manager._SimMonitor(
+                initial_count=self._initial_sim_idx,
+                n_simulations=self.number_of_simulations,
+                start_time=time(),
+            )
+
+            processes = []
+            seeds = np.random.SeedSequence().spawn(n_workers - 1)
+
+            for seed in seeds:
+                sim_producer = multiprocess.Process(
+                    target=self.__sim_producer,
+                    args=(
+                        self.environment,
+                        self.rocket,
+                        self.flight,
+                        sim_monitor,
+                        self.export_list,
+                        self.export_sample_time,
+                        export_queue,
+                        self._error_file,
+                        mutex,
+                        seed,
+                    ),
+                )
+                processes.append(sim_producer)
+
+            for sim_producer in processes:
+                sim_producer.start()
+
+            sim_consumer = multiprocess.Process(
+                target=self.__sim_consumer,
+                args=(
+                    export_queue,
+                    self._input_file,
+                    self._output_file,
+                    mutex,
+                    consumer_stop_event,
+                ),
+            )
+
+            sim_consumer.start()
+
+            for sim_producer in processes:
+                sim_producer.join()
+
+            consumer_stop_event.set()
+
+            sim_consumer.join()
+
+            sim_monitor.print_final_status()
+
+    @staticmethod
+    def __sim_producer(
+        sto_env,
+        sto_rocket,
+        sto_flight,
+        sim_monitor,
+        export_list,
+        export_sample_time,
+        export_queue,
+        error_file,
+        mutex,
+        seed,
+    ):
+        """Simulation producer to be used in parallel by multiprocessing.
+
+        Parameters
+        ----------
+        sto_env : StochasticEnvironment
+            The stochastic environment object to be iterated over.
+        sto_rocket : StochasticRocket
+            The stochastic rocket object to be iterated over.
+        sto_flight : StochasticFlight
+            The stochastic flight object to be iterated over.
+        sim_monitor : _SimMonitor
+            The simulation monitor object to keep track of the simulations.
+        export_list : list
+            The list of variables to export at each simulation.
+        export_sample_time : float
+            Sample time to downsample the arrays in seconds.
+        export_queue : multiprocess.Queue
+            The queue to export the results.
+        error_file : str
+            The file to write the errors.
+        mutex : multiprocess.Lock
+            The mutex to lock access to critical regions.
+        seed : int
+            The seed to set the random number generator.
+        """
+        try:
+            while sim_monitor.keep_simulating():
+                sim_idx = sim_monitor.increment() - 1
+
+                sto_env._set_stochastic(seed)
+                sto_rocket._set_stochastic(seed)
+                sto_flight._set_stochastic(seed)
+
+                inputs_dict, outputs_dict = MonteCarlo.__run_single_simulation(
+                    sim_idx,
+                    sto_env,
+                    sto_rocket,
+                    sto_flight,
+                    export_list,
+                    export_sample_time,
+                )
+
+                export_queue.put((inputs_dict, outputs_dict))
+
+                mutex.acquire()
+                sim_monitor.print_update_status(sim_idx)
+                mutex.release()
+
+        except Exception as error:
+            mutex.acquire()
+            with open(error_file, "a", encoding="utf-8") as file:
+                file.write(json.dumps(inputs_dict, cls=RocketPyEncoder) + "\n")
+
+            MonteCarlo._reprint(f"Error on iteration {sim_idx}: {error}")
+            mutex.release()
+
+            raise error
+
+    @staticmethod
+    def __sim_consumer(
+        export_queue,
+        inputs_file,
+        outputs_file,
+        mutex,
+        stop_event,
+    ):
+        """Simulation consumer to be used in parallel by multiprocessing.
+        It consumes the results from the queue and writes them to the files.
+        If no results are received for 30 seconds, a TimeoutError is raised.
+
+        Parameters
+        ----------
+        export_queue : multiprocess.Queue
+            The queue to export the results.
+        inputs_file : str
+            The file path to write the inputs.
+        outputs_file : str
+            The file path to write the outputs.
+        mutex : multiprocess.Lock
+            The mutex to lock access to critical regions.
+        stop_event : multiprocess.Event
+            The event indicating that the simulations are done.
+        """
+        trials = 0
+        while not stop_event.is_set():
+            try:
+                mutex.acquire()
+                inputs_dict, outputs_dict = export_queue.get(timeout=3)
+
+                MonteCarlo.__export_flight_data(
+                    inputs_dict,
+                    outputs_dict,
+                    inputs_file,
+                    outputs_file,
+                )
+
+            except queue.Empty as exc:
+                trials += 1
+
+                if trials > 10:
+                    raise TimeoutError(
+                        "No simulations were received for 30 seconds."
+                    ) from exc
+
+            finally:
+                mutex.release()
+
+    @staticmethod
+    def __run_single_simulation(
+        sim_idx, sto_env, sto_rocket, sto_flight, export_list, export_sample_time
+    ):
+        """Runs a single simulation and returns the inputs and outputs.
+
+        Parameters
+        ----------
+        sim_idx : int
+            The index of the simulation.
+        sto_env : StochasticEnvironment
+            The stochastic environment object to be iterated over.
+        sto_rocket : StochasticRocket
+            The stochastic rocket object to be iterated over.
+        sto_flight : StochasticFlight
+            The stochastic flight object to be iterated over.
+        export_list : list
+            The list of variables to export at each simulation.
+        export_sample_time : float
+            Sample time to downsample the arrays in seconds.
+        """
         monte_carlo_flight = Flight(
-            rocket=self.rocket.create_object(),
-            environment=self.environment.create_object(),
-            rail_length=self.flight._randomize_rail_length(),
-            inclination=self.flight._randomize_inclination(),
-            heading=self.flight._randomize_heading(),
-            initial_solution=self.flight.initial_solution,
-            terminate_on_apogee=self.flight.terminate_on_apogee,
+            rocket=sto_rocket.create_object(),
+            environment=sto_env.create_object(),
+            rail_length=sto_flight._randomize_rail_length(),
+            inclination=sto_flight._randomize_inclination(),
+            heading=sto_flight._randomize_heading(),
+            initial_solution=sto_flight.initial_solution,
+            terminate_on_apogee=sto_flight.terminate_on_apogee,
         )
 
-        self._inputs_dict = dict(
+        inputs_dict = dict(
             item
             for d in [
-                self.environment.last_rnd_dict,
-                self.rocket.last_rnd_dict,
-                self.flight.last_rnd_dict,
+                sto_env.last_rnd_dict,
+                sto_rocket.last_rnd_dict,
+                sto_flight.last_rnd_dict,
             ]
             for item in d.items()
         )
+        inputs_dict["idx"] = sim_idx
 
-        self.__export_flight_data(
-            flight=monte_carlo_flight,
-            inputs_dict=self._inputs_dict,
-            input_file=input_file,
-            output_file=output_file,
+        inputs_dict = MonteCarlo.prepare_export_data(
+            inputs_dict, export_sample_time, remove_functions=True
         )
 
-        average_time = (process_time() - self.__start_cpu_time) / self.__iteration_count
-        estimated_time = int(
-            (self.number_of_simulations - self.__iteration_count) * average_time
-        )
-        self.__reprint(
-            f"Current iteration: {self.__iteration_count:06d} | "
-            f"Average Time per Iteration: {average_time:.3f} s | "
-            f"Estimated time left: {estimated_time} s",
-            end="\r",
-            flush=True,
-        )
+        outputs_dict = {
+            export_item: getattr(monte_carlo_flight, export_item)
+            for export_item in export_list
+        }
 
-    def __close_files(self, input_file, output_file, error_file):
-        """
-        Closes all the files.
+        return inputs_dict, outputs_dict
 
-        Parameters
-        ----------
-        input_file : str
-            The file object to write the inputs.
-        output_file : str
-            The file object to write the outputs.
-        error_file : str
-            The file object to write the errors.
-
-        Returns
-        -------
-        None
-        """
-        input_file.close()
-        output_file.close()
-        error_file.close()
-
-    def __terminate_simulation(self, input_file, output_file, error_file):
-        """
-        Terminates the simulation, closes the files and prints the results.
-
-        Parameters
-        ----------
-        input_file : str
-            The file object to write the inputs.
-        output_file : str
-            The file object to write the outputs.
-        error_file : str
-            The file object to write the errors.
-
-        Returns
-        -------
-        None
-        """
-        final_string = (
-            f"Completed {self.__iteration_count} iterations. Total CPU time: "
-            f"{process_time() - self.__start_cpu_time:.1f} s. Total wall time: "
-            f"{time() - self.__start_time:.1f} s\n"
-        )
-
-        self.__reprint(final_string + "Saving results.", flush=True)
-
-        # close files to guarantee saving
-        self.__close_files(input_file, output_file, error_file)
-
-        # resave the files on self and calculate post simulation attributes
-        self.input_file = f"{self.filename}.inputs.txt"
-        self.output_file = f"{self.filename}.outputs.txt"
-        self.error_file = f"{self.filename}.errors.txt"
-
-        print(f"Results saved to {self._output_file}")
-
+    @staticmethod
     def __export_flight_data(
-        self,
-        flight,
         inputs_dict,
-        input_file,
-        output_file,
+        outputs_dict,
+        inputs_file,
+        outputs_file,
     ):
         """
         Exports the flight data to the respective files.
 
         Parameters
         ----------
-        flight : Flight
-            The Flight object containing the flight data.
         inputs_dict : dict
-            Dictionary containing the inputs used in the simulation.
-        input_file : str
+            Dictionary with the inputs of the simulation.
+        outputs_dict : dict
+            Dictionary with the outputs of the simulation.
+        inputs_file : str
             The file object to write the inputs.
-        output_file : str
+        outputs_file : str
             The file object to write the outputs.
 
         Returns
         -------
         None
         """
-        results = {
-            export_item: getattr(flight, export_item)
-            for export_item in self.export_list
-        }
+        with open(inputs_file, "a", encoding="utf-8") as file:
+            file.write(json.dumps(inputs_dict, cls=RocketPyEncoder) + "\n")
+        with open(outputs_file, "a", encoding="utf-8") as file:
+            file.write(json.dumps(outputs_dict, cls=RocketPyEncoder) + "\n")
 
-        input_file.write(json.dumps(inputs_dict, cls=RocketPyEncoder) + "\n")
-        output_file.write(json.dumps(results, cls=RocketPyEncoder) + "\n")
+    def __terminate_simulation(self):
+        """
+        Terminates the simulation, closes the files and prints the results.
+
+        Returns
+        -------
+        None
+        """
+        # resave the files on self and calculate post simulation attributes
+        self.input_file = self.batch_path / f"{self.filename}.inputs.txt"
+        self.output_file = self.batch_path / f"{self.filename}.outputs.txt"
+        self.error_file = self.batch_path / f"{self.filename}.errors.txt"
+
+        MonteCarlo._reprint(f"Results saved to {self._output_file}")
 
     def __check_export_list(self, export_list):
         """
@@ -466,7 +725,8 @@ class MonteCarlo:
 
         return export_list
 
-    def __reprint(self, msg, end="\n", flush=False):
+    @staticmethod
+    def _reprint(msg, end="\n", flush=False):
         """
         Prints a message on the same line as the previous one and replaces the
         previous message with the new one, deleting the extra characters from
@@ -485,13 +745,14 @@ class MonteCarlo:
         -------
         None
         """
-        len_msg = len(msg)
-        if len_msg < self._last_print_len:
-            msg += " " * (self._last_print_len - len_msg)
-        else:
-            self._last_print_len = len_msg
+        padding = ""
 
-        print(msg, end=end, flush=flush)
+        if len(msg) < MonteCarlo._last_print_len:
+            padding = " " * (MonteCarlo._last_print_len - len(msg))
+
+        MonteCarlo._last_print_len = len(msg)
+
+        print(msg + padding, end=end, flush=flush)
 
     # Properties and setters
 
@@ -689,7 +950,7 @@ class MonteCarlo:
             with open(filepath, "r+", encoding="utf-8"):
                 self.output_file = filepath
 
-        print(
+        MonteCarlo._reprint(
             f"A total of {self.num_of_loaded_sims} simulations results were "
             f"loaded from the following output file: {self.output_file}\n"
         )
@@ -717,7 +978,7 @@ class MonteCarlo:
             with open(filepath, "r+", encoding="utf-8"):
                 self.input_file = filepath
 
-        print(f"The following input file was imported: {self.input_file}")
+        MonteCarlo._reprint(f"The following input file was imported: {self.input_file}")
 
     def import_errors(self, filename=None):
         """
@@ -741,7 +1002,7 @@ class MonteCarlo:
         except FileNotFoundError:
             with open(filepath, "r+", encoding="utf-8"):
                 self.error_file = filepath
-        print(f"The following error file was imported: {self.error_file}")
+        MonteCarlo._reprint(f"The following error file was imported: {self.error_file}")
 
     def import_results(self, filename=None):
         """
@@ -879,3 +1140,212 @@ class MonteCarlo:
         self.info()
         self.plots.ellipses()
         self.plots.all()
+
+    @staticmethod
+    def time_function_serializer(function_object, t_range=None, sample_time=None):
+        """
+        Method to serialize a Function object into a numpy array. If the function is
+        callable, it will be discretized. If the downsample_time is specified, the
+        function will be downsampled. This serializer should not be used for
+        function that are not time dependent.
+
+        Parameters
+        ----------
+        function_object : Function
+            Function object to be serialized.
+        t_range : tuple, optional
+            Tuple with the initial and final time of the function. Default is None.
+        sample_time : float, optional
+            Time interval between samples. Default is None.
+
+        Returns
+        -------
+        np.ndarray
+            Serialized function as a numpy array.
+        """
+        func = deepcopy(function_object)
+
+        # Discretize the function if it is callable
+        if callable(function_object.source):
+            if t_range is not None:
+                func.set_discrete(*t_range, (t_range[1] - t_range[0]) / sample_time)
+            else:
+                raise ValueError("t_range must be specified for callable functions")
+
+        source = func.get_source()
+
+        # Ensure the downsampling is applied
+        if sample_time is not None:
+            t0 = source[0, 0]
+            tf = source[-1, 0]
+            t = np.arange(t0, tf, sample_time)
+            y = func(t)
+            source = np.column_stack((t, y))
+
+        return source
+
+    @staticmethod
+    def prepare_export_data(obj, sample_time=0.1, remove_functions=False):
+        """
+        Inspects the attributes of an object and returns a dictionary of its
+        attributes.
+
+        Parameters
+        ----------
+        obj : object
+            The object whose attributes are to be inspected.
+        sample_time : float, optional
+            Time interval between samples. Default is 0.1.
+        remove_functions : bool, optional
+            If True, the Function objects will not be serialized. Default is False.
+
+        Returns
+        -------
+        dict
+            A dictionary containing the attributes of the object.
+            If the attribute is a Function object, it is serialized using
+            `function_serializer`. If the attribute is a dictionary, it is recursively
+            inspected using `inspect_object_attributes`. Only includes attributes that
+            are integers, floats, dictionaries or Function objects.
+        """
+        result = {}
+
+        if isinstance(obj, dict):
+            # Iterate through all attributes of the object
+            for attr_name, attr_value in obj.items():
+                # Filter out private attributes and check if the attribute is of a type we are interested in
+                if not attr_name.startswith('_') and isinstance(
+                    attr_value, (int, float, dict, Function)
+                ):
+                    if isinstance(attr_value, (int, float)):
+                        result[attr_name] = attr_value
+
+                    elif isinstance(attr_value, dict):
+                        result[attr_name] = MonteCarlo.prepare_export_data(
+                            attr_value, sample_time
+                        )
+
+                    elif not remove_functions and isinstance(attr_value, Function):
+                        # Serialize the Functions
+                        result[attr_name] = MonteCarlo.time_function_serializer(
+                            attr_value, None, sample_time
+                        )
+        else:
+            # Iterate through all attributes of the object
+            for attr_name in dir(obj):
+                attr_value = getattr(obj, attr_name)
+
+                # Filter out private attributes and check if the attribute is of a type we are interested in
+                if not attr_name.startswith('_') and isinstance(
+                    attr_value, (int, float, dict, Function)
+                ):
+                    if isinstance(attr_value, (int, float)):
+                        result[attr_name] = attr_value
+
+                    elif isinstance(attr_value, dict):
+                        result[attr_name] = MonteCarlo.prepare_export_data(
+                            attr_value, sample_time
+                        )
+
+                    elif not remove_functions and isinstance(attr_value, Function):
+                        # Serialize the Functions
+                        result[attr_name] = MonteCarlo.time_function_serializer(
+                            attr_value, None, sample_time
+                        )
+
+        return result
+
+
+def import_multiprocess():
+    """Import the necessary modules and submodules for the
+    multiprocess library.
+
+    Returns
+    -------
+    tuple
+        Tuple containing the imported modules.
+    """
+    multiprocess = import_optional_dependency("multiprocess")
+    managers = import_optional_dependency("multiprocess.managers")
+
+    return multiprocess, managers
+
+
+def create_multiprocess_manager(multiprocess, managers):
+    """Creates a manager for the multiprocess control of the
+    Monte Carlo simulation.
+
+    Parameters
+    ----------
+    multiprocess : module
+        Multiprocess module.
+    managers : module
+        Managing submodules of the multiprocess module.
+
+    Returns
+    -------
+    MonteCarloManager
+        Subclass of BaseManager with the necessary classes registered.
+    """
+
+    class MonteCarloManager(managers.BaseManager):
+        """Custom manager for shared objects in the Monte Carlo simulation."""
+
+        def __init__(self):
+            super().__init__()
+            self.register('Lock', multiprocess.Lock)
+            self.register('Queue', multiprocess.Queue)
+            self.register('Event', multiprocess.Event)
+            self.register('_SimMonitor', _SimMonitor)
+
+    return MonteCarloManager()
+
+
+class _SimMonitor:
+    """Class to monitor the simulation progress and display the status."""
+
+    def __init__(self, initial_count, n_simulations, start_time):
+        self.initial_count = initial_count
+        self.count = initial_count
+        self.n_simulations = n_simulations
+        self.start_time = start_time
+
+    def keep_simulating(self):
+        return self.count < self.n_simulations
+
+    def increment(self):
+        self.count += 1
+        return self.count
+
+    def print_update_status(self, sim_idx):
+        """Prints a message on the same line as the previous one and replaces
+        the previous message with the new one, deleting the extra characters
+        from the previous message.
+
+        Parameters
+        ----------
+        sim_idx : int
+            Index of the current simulation.
+
+        Returns
+        -------
+        None
+        """
+        average_time = (time() - self.start_time) / (self.count - self.initial_count)
+        estimated_time = int((self.n_simulations - self.count) * average_time)
+
+        msg = f"Current iteration: {sim_idx:06d}"
+        msg += f" | Average Time per Iteration: {average_time:.3f} s"
+        msg += f" | Estimated time left: {estimated_time} s"
+
+        MonteCarlo._reprint(msg, end="\r", flush=True)
+
+    def print_final_status(self):
+        """Prints the final status of the simulation."""
+        print()
+        performed_sims = self.count - self.initial_count
+        msg = f"Completed {performed_sims} iterations."
+        msg += f" In total, {self.n_simulations} simulations are exported.\n"
+        msg += f"Total wall time: {time() - self.start_time:.1f} s"
+
+        MonteCarlo._reprint(msg, end="\n", flush=True)
